@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../../human_motion"
+		},
+		{
+			"path": "../../../../Dataset"
+		},
+		{
+			"path": "../../.."
+		}
+	],
+	"settings": {}
+}

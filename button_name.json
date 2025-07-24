@@ -1,0 +1,23 @@
+{
+    "leftHand": "左手",
+    "leftForeArm": "左前臂",
+    "leftUpperArm": "左上臂",
+    "leftShoulder": "左肩",
+    "rightShoulder": "右肩",
+    "rightUpperArm": "右上臂",
+    "rightForeArm": "右前臂",
+    "rightHand": "右手",
+    "leftNeck": "左颈",
+    "rightNeck": "右颈",
+    "upperSpine": "上脊柱",
+    "middleSpine": "中脊柱",
+    "hip": "髋",
+    "buttocks_left": "左臀",
+    "buttocks_right": "右臀",
+    "leftUpperLeg": "左大腿",
+    "leftLowerLeg": "左小腿",
+    "leftFoot": "左脚",
+    "rightUpperLeg": "右大腿",
+    "rightLowerLeg": "右小腿",
+    "rightFoot": "右脚"
+}
