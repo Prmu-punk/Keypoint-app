@@ -109,8 +109,6 @@ class KeyPointApp:
         self.load_config_files()
         self.setup_ui()
         self.load_data(args)
-
-        self.show_video_interval(0, 10)
     
     def configure_emoji_fonts(self):
         """配置支持emoji的字体"""
@@ -333,14 +331,14 @@ class KeyPointApp:
         self.cap = cv2.VideoCapture(f"{self.video_dir}/video.mp4")
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.current_frame = 0
-        # if os.path.exists(f"{self.video_dir}/kp_record"):
-        #     shutil.rmtree(f"{self.video_dir}/kp_record")
-        # os.makedirs(f"{self.video_dir}/kp_record")
+        if os.path.exists(f"{self.video_dir}/kp_record"):
+            shutil.rmtree(f"{self.video_dir}/kp_record")
+        os.makedirs(f"{self.video_dir}/kp_record")
 
-        # for frame in range(self.current_frame, self.total_frames):
-        #     save_name = f"{frame}".zfill(5)
-        #     with open(f"{args.video_dir}/kp_record/{save_name}.json", "w") as file:
-        #         json.dump(self.kp_pair, file, indent=4)
+        for frame in range(self.current_frame, self.total_frames):
+            save_name = f"{frame}".zfill(5)
+            with open(f"{args.video_dir}/kp_record/{save_name}.json", "w") as file:
+                json.dump(self.kp_pair, file, indent=4)
 
         self.progress_bar.config(to=self.total_frames - 1)
         ret, frame = self.cap.read()

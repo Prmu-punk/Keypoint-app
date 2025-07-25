@@ -38,7 +38,7 @@ def resource_path(relative_path):
 #                          num_betas=10,
 #                          num_expression_coeffs=10,use_pca=False,use_face_contour=True,flat_hand_mean=True,**layer_arg).cuda()
 model_type = 'smplx'
-model_folder = resource_path("SMPLX_NEUTRAL.npz")
+model_folder = resource_path("video_optimizer/smpl_models/SMPLX_NEUTRAL.npz")
 model = smplx.create(model_folder, model_type=model_type,
                             gender='neutral',
                             num_betas=10,
@@ -146,7 +146,7 @@ def kp_use(output, hand_poses, obj_orgs, sampled_orgs,
     #     body_params["body_pose"][i], hand_poses[str(i)]["left_hand"], hand_poses[str(i)]["right_hand"] \
     #         = update_hand_pose(hand_poses, body_params["global_orient"], body_params["body_pose"], i)
 
-    hoi_solver= HOISolver(model_folder=resource_path('SMPLX_NEUTRAL.npz'))
+    hoi_solver= HOISolver(model_folder=resource_path('video_optimizer/smpl_models/SMPLX_NEUTRAL.npz'))
 
     for i, file in tqdm(enumerate(kp_files[start_frame:end_frame])):
         annotation = json.load(open(os.path.join(video_dir, 'kp_record', file)))
@@ -235,9 +235,9 @@ def kp_use(output, hand_poses, obj_orgs, sampled_orgs,
     # optimizer.save_sequence(os.path.join(args.video_dir, 'optimized_sequence'))
 
     # 渲染视频
-    R = output["global_R"][0]
-    T = output["global_T"][0]
-    optimizer.create_visualization_video(os.path.join(video_dir, "optimized_frames"), K=K,
+    R = torch.eye(3).cuda()
+    T = torch.zeros(3).cuda()
+    optimizer.create_visualization_video_front(os.path.join(video_dir, "optimized_frames"), K=K,
                                          R=R, T=T, video_path=os.path.join(video_dir, "optimize_video.mp4"))
 
 

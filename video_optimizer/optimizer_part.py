@@ -15,6 +15,7 @@ from torch import nn
 import tqdm
 from .utils.loss_utils import HOCollisionLoss  
 from pytorch3d.structures import Meshes  
+from einops import einsum, rearrange
 from PIL import Image
 from pytorch3d.renderer.cameras import FoVPerspectiveCameras     
 from tqdm import tqdm  
@@ -36,49 +37,8 @@ import time
 from scipy.ndimage.morphology import distance_transform_edt
 from pykalman import KalmanFilter
 from scipy.spatial.transform import Rotation
-from visualize_global import get_global
 import gtsam
 
-def convert_extrinsic_o3d(R, T):
-    """
-    将 Blender 外参 (R, T) 转换为适合 Open3D 的相机视角矩阵。
-
-    Args:
-        R: 3x3 numpy array or torch tensor，旋转矩阵
-        T: 3 numpy array or torch tensor，平移向量
-
-    Returns:
-        view_matrix: 4x4 numpy array，Open3D 视角矩阵
-    """
-    # 转换为 numpy 数组（如果是 tensor）
-    if 'torch' in str(type(R)):
-        R = R.cpu().numpy()
-    if 'torch' in str(type(T)):
-        T = T.cpu().numpy()
-
-    # Blender 外参矩阵 (相机在世界坐标系变换矩阵)
-    E_blender = np.eye(4)
-    E_blender[:3, :3] = R
-    E_blender[:3, 3] = T
-
-    # 坐标系转换矩阵 M
-    M = np.array([
-        [1,  0,  0, 0],
-        [0, -1,  0, 0],
-        [0,  0, -1, 0],
-        [0,  0,  0, 1]
-    ])
-
-    # 进行坐标系转换
-    E_o3d = M @ E_blender @ np.linalg.inv(M)
-
-    # Open3D 视角矩阵是外参矩阵的逆
-    try:
-        view_matrix = np.linalg.inv(E_o3d)
-    except np.linalg.LinAlgError:
-        view_matrix = np.eye(4)
-
-    return view_matrix
 def resource_path(relative_path):
     try:
         # PyInstaller创建的临时文件夹路径
@@ -88,11 +48,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-def apply_transform_to_model(vertices, transform_matrix):
-    homogenous_verts = np.hstack([vertices, np.ones((len(vertices), 1))])
-    transformed = (transform_matrix @ homogenous_verts.T).T
-    return transformed[:, :3] / transformed[:, [3]]
-
+J_regressor = torch.load(resource_path("video_optimizer/J_regressor.pt")).float().cuda()
 def load_downsampling_mapping(filepath):
     data = np.load(filepath)
     from scipy.sparse import csr_matrix
@@ -154,7 +110,7 @@ class VideoBodyObjectOptimizer:
         self.image_size = max(width, height)
         self.lr = lr
         # self.obj_scale = nn.Parameter(torch.tensor(1.0).float().cuda(), requires_grad=True)
-        self.hoi_solver =  HOISolver(model_folder=resource_path('SMPLX_NEUTRAL.npz'))
+        self.hoi_solver =  HOISolver(model_folder=resource_path('video_optimizer/smpl_models/SMPLX_NEUTRAL.npz'))
 
         
         # learnable parameters  
@@ -1198,39 +1154,9 @@ class VideoBodyObjectOptimizer:
             frame_dir = os.path.join(output_dir, f'frame_{i + self.start_frame:04d}')  
             os.makedirs(frame_dir, exist_ok=True)   
             self.current_frame = i 
-            human_faces = self.get_body_faces(sampled=True)  
-            # 进行与create_visualization_video中同样的变换操作
-            # 1. 获取人体和物体顶点
-            human_verts = self.get_body_points(i, sampled=True).detach().cpu().numpy()
+            human_faces = self.get_body_faces(sampled=False)  
+            human_verts = self.get_body_points(i, sampled=False).detach().cpu().numpy()
             object_vertices = self.get_object_points(i, sampled=True).detach().cpu().numpy()
-
-            # 2. 第一次全局变换（SMPL参数）
-            axis_angle = self.global_orient[i].detach().cpu().numpy()
-            R_2ori = Rotation.from_rotvec(axis_angle).as_matrix()
-            T_2ori = self.transl[i].detach().cpu().numpy().squeeze()
-            T_2ori[1] -= 0.7
-            T_2ori[0] += 0.13
-
-            transformation_matrix = np.eye(4)
-            transformation_matrix[:3, :3] = R_2ori.T
-            transformation_matrix[:3, 3] = - R_2ori.T @ T_2ori
-
-            hverts = apply_transform_to_model(human_verts, transformation_matrix)
-            overts = apply_transform_to_model(object_vertices, transformation_matrix)
-
-            print(self.global_body_params.keys())
-            axis_angle = self.global_body_params["global_orient"][i + self.start_frame].cpu().numpy()
-            global_R = Rotation.from_rotvec(axis_angle).as_matrix()
-            global_T = self.global_body_params["transl"][i + self.start_frame].cpu().numpy()
-            global_T[0] -= 0.12
-            global_T[1] -= 0.01
-            global_T[2] += 0.03
-
-            transformation_matrix = np.eye(4)
-            transformation_matrix[:3, :3] = global_R
-            transformation_matrix[:3, 3] = global_T
-            human_verts = apply_transform_to_model(hverts, transformation_matrix)
-            object_vertices = apply_transform_to_model(overts, transformation_matrix)
             # 保存人体mesh  
             h_mesh = o3d.geometry.TriangleMesh()  
             h_mesh.vertices = o3d.utility.Vector3dVector(human_verts)  
@@ -1260,7 +1186,8 @@ class VideoBodyObjectOptimizer:
             o3d.io.write_line_set(os.path.join(frame_dir, 'contact_points.ply'), line_set)  
     
     def create_visualization_video(self, output_dir, K, R, T, video_path=None, fps=3, 
-                                            rotation_angle=90, rotation_axis='y'):
+                                            rotation_angle=90, rotation_axis='y'):    
+
         def rotate_camera(rotation_angle, rotation_axis):
             camera_rotation_rad = math.radians(rotation_angle)
             if rotation_axis.lower() == 'y':
@@ -1317,7 +1244,10 @@ class VideoBodyObjectOptimizer:
         final_R = rotated_R
         final_T = new_camera_pos.flatten()
 
-        view_matrix = convert_extrinsic_o3d(final_R, final_T)
+        extrinsic_matrix = np.eye(4)
+        extrinsic_matrix[:3, :3] = final_R
+        extrinsic_matrix[:3, 3] = final_T
+        view_matrix = np.linalg.inv(extrinsic_matrix)
         def create_camera_pyramid(length=0.03, base=0.02):
             # 顶点数据：锥体的尖端+底面4点
             tip = np.array([[0, 0, length]])
@@ -1353,7 +1283,7 @@ class VideoBodyObjectOptimizer:
 
         orig_pyramid = create_camera_pyramid(camera_pyramid_length, camera_pyramid_base)
         orig_pyramid.paint_uniform_color([1.0, 0.2, 0.2])  # 红色
-        orig_pyramid = apply_transform(orig_pyramid, np.eye(3), original_camera_pos.flatten())
+        orig_pyramid = apply_transform(orig_pyramid, R_np, original_camera_pos.flatten())
         o3d.io.write_triangle_mesh(os.path.join(output_dir, "camera_original.obj"), orig_pyramid)
 
         rotated_pyramid = create_camera_pyramid(camera_pyramid_length, camera_pyramid_base)
@@ -1384,41 +1314,16 @@ class VideoBodyObjectOptimizer:
         # print(f"相机到物体方向: {to_object}")
         # print(f"方向一致性 (dot product): {np.dot(camera_forward, to_object):.3f}")
         os.makedirs(output_dir, exist_ok=True)
-        human_faces = np.array(self.get_body_faces(sampled=True), dtype=np.int32)
+        human_faces = np.array(self.get_body_faces(sampled=False), dtype=np.int32)
 
 
         for i in tqdm(range(0, self.seq_length, 2), desc=f"Processing frames with {rotation_angle}° rotation"):
 
-            human_verts = self.get_body_points(i, sampled=True).detach().cpu().numpy()
+            human_verts = self.get_body_points(i, sampled=False).detach()
             object_vertices = self.get_object_points(i, sampled=True).detach().cpu().numpy()
 
             # transform to global
-            axis_angle = self.global_orient[i].detach().cpu().numpy()
-            R_2ori = Rotation.from_rotvec(axis_angle).as_matrix()
-            T_2ori = self.transl[i].detach().cpu().numpy().squeeze()
-            T_2ori[1] -= 0.7
-            T_2ori[0] += 0.13
 
-            transformation_matrix = np.eye(4)
-            transformation_matrix[:3, :3] = R_2ori.T
-            transformation_matrix[:3, 3] = - R_2ori.T @ T_2ori
-
-            hverts = apply_transform_to_model(human_verts, transformation_matrix)
-            overts = apply_transform_to_model(object_vertices, transformation_matrix)
-
-
-            axis_angle = self.global_body_params["global_orient"][i + self.start_frame].cpu().numpy()
-            global_R = Rotation.from_rotvec(axis_angle).as_matrix()
-            global_T = self.global_body_params["transl"][i + self.start_frame].cpu().numpy()
-            global_T[0] -= 0.12
-            global_T[1] -= 0.01
-            global_T[2] += 0.03
-
-            transformation_matrix = np.eye(4)
-            transformation_matrix[:3, :3] = global_R
-            transformation_matrix[:3, 3] = global_T
-            human_verts = apply_transform_to_model(hverts, transformation_matrix)
-            object_vertices = apply_transform_to_model(overts, transformation_matrix)
 
             render.scene.clear_geometry()
             human_mesh = o3d.geometry.TriangleMesh()
@@ -1460,8 +1365,10 @@ class VideoBodyObjectOptimizer:
             cx=K_np[0, 2] * (render_size / self.image_size),  
             cy=K_np[1, 2] * (render_size / self.image_size)  
         )  
-
-        view_matrix = convert_extrinsic_o3d(R, T)
+        extrinsic_matrix = np.eye(4)
+        extrinsic_matrix[:3, :3] = R.cpu().numpy()
+        extrinsic_matrix[:3, 3] = T.cpu().numpy()
+        view_matrix = np.linalg.inv(extrinsic_matrix)
         human_faces = np.array(self.get_body_faces(sampled=True), dtype=np.int32) 
         for i in tqdm(range(0, self.seq_length, 2), desc="rendering frames"):  
             render.scene.clear_geometry()  
