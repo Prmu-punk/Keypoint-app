@@ -4,6 +4,7 @@ import numpy as np
 import open3d as o3d
 import json
 import os
+import sys
 import trimesh
 import time
 from scipy.optimize import least_squares
@@ -11,7 +12,12 @@ from scipy.spatial.transform import Rotation as R
 from .utils.hoi_utils import load_transformation_matrix
 from copy import deepcopy
 from icppnp import solve_weighted_priority
-
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 class HOISolver:
     def __init__(self, model_folder, device=None):
@@ -267,7 +273,7 @@ class HOISolver:
 
     def solve_hoi(self, obj_init, obj_sample_init, body_params,i,start_frame, end_frame,hand_poses,
                          object_points_idx, body_points_idx, object_points, image_points, K, joint_mapping,
-                         part_kp_file="./video_optimizer/data/part_kp.json", save_meshes=False):
+                         part_kp_file=resource_path("video_optimizer/data/part_kp.json"), save_meshes=False):
         """
         直接求解HOI，输入预处理的物体和人体参数
         Args:
