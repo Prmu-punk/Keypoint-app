@@ -237,7 +237,7 @@ def kp_use(output, hand_poses, obj_orgs, sampled_orgs,
     # 渲染视频
     R = torch.eye(3).cuda()
     T = torch.zeros(3).cuda()
-    optimizer.create_visualization_video_front(os.path.join(video_dir, "optimized_frames"), K=K,
+    optimizer.create_visualization_video(os.path.join(video_dir, "optimized_frames"), K=K,
                                          R=R, T=T, video_path=os.path.join(video_dir, "optimize_video.mp4"))
 
 

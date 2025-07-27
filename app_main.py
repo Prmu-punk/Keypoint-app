@@ -109,6 +109,8 @@ class KeyPointApp:
         self.load_config_files()
         self.setup_ui()
         self.load_data(args)
+
+        # self.show_video_interval(0, 10)
     
     def configure_emoji_fonts(self):
         """配置支持emoji的字体"""
@@ -704,11 +706,10 @@ class KeyPointApp:
     
     def open_o3d_viewer(self):
         """打开3D查看器"""
-        vertices = self.obj_orgs[self.current_frame].vertices
-        vertices = vertices + self.centers[self.current_frame]
-        self.obj_orgs[self.current_frame].vertices = o3d.utility.Vector3dVector(vertices)
-
-        mesh = self.obj_orgs[self.current_frame]
+        vertices = self.obj_orgs[self.current_frame].vertices + self.centers[self.current_frame]
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(vertices)
+        mesh.triangles = self.obj_orgs[self.current_frame].triangles
         mesh.compute_vertex_normals()
         body_pose = self.body_pose_params[self.current_frame]
         shape = self.shape_params[self.current_frame]
@@ -773,10 +774,10 @@ class KeyPointApp:
                 self.obj_point = str(nearest_idx)
             else:
                 self.obj_point = str(picked_idx)
-            self.point_label.config(text=f"📍 Selected point: {self.obj_point}")
+            self.point_label.config(text=f"Selected point: {self.obj_point}")
         else:
             self.obj_point = None
-            self.point_label.config(text="📍 No point selected")
+            self.point_label.config(text="No point selected")
         vis.destroy_window()
     
     def update_plot(self):

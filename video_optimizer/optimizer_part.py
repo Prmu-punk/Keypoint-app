@@ -36,7 +36,7 @@ import torchvision.transforms.functional as TF
 import time
 from scipy.ndimage.morphology import distance_transform_edt
 from pykalman import KalmanFilter
-from scipy.spatial.transform import Rotation
+from .utils.camera_utils import create_camera_for_object, transform_to_global
 import gtsam
 
 def resource_path(relative_path):
@@ -1157,6 +1157,9 @@ class VideoBodyObjectOptimizer:
             human_faces = self.get_body_faces(sampled=False)  
             human_verts = self.get_body_points(i, sampled=False).detach().cpu().numpy()
             object_vertices = self.get_object_points(i, sampled=True).detach().cpu().numpy()
+            incam_params = (self.global_orient[i], self.transl[i])
+            global_params = (self.global_body_params["global_orient"][i], self.global_body_params["transl"][i])
+            human_verts, object_vertices = transform_to_global(human_verts, object_vertices, incam_params, global_params)
             # 保存人体mesh  
             h_mesh = o3d.geometry.TriangleMesh()  
             h_mesh.vertices = o3d.utility.Vector3dVector(human_verts)  
@@ -1186,7 +1189,7 @@ class VideoBodyObjectOptimizer:
             o3d.io.write_line_set(os.path.join(frame_dir, 'contact_points.ply'), line_set)  
     
     def create_visualization_video(self, output_dir, K, R, T, video_path=None, fps=3, 
-                                            rotation_angle=90, rotation_axis='y'):    
+                                            rotation_angle=0, rotation_axis='y'):    
 
         def rotate_camera(rotation_angle, rotation_axis):
             camera_rotation_rad = math.radians(rotation_angle)
@@ -1226,23 +1229,40 @@ class VideoBodyObjectOptimizer:
         middle_frame = self.seq_length // 2
         self.current_frame = middle_frame
         object_vertices = self.get_object_points(middle_frame, sampled=True).detach().cpu().numpy()
-        object_center = np.mean(object_vertices, axis=0).reshape(3, 1)
+        human_vertices = self.get_body_points(middle_frame, sampled=False).detach().cpu().numpy()
+        incam_params = (self.global_orient[middle_frame], self.transl[middle_frame])
+        global_params = (self.global_body_params["global_orient"][middle_frame], self.global_body_params["transl"][middle_frame])
+        human_vertices, object_vertices = transform_to_global(human_vertices, object_vertices, incam_params, global_params)
+        all_vertices = np.vstack((human_vertices, object_vertices))
+        camera_params = create_camera_for_object(
+            all_vertices,
+            image_width=render_size,
+            image_height=render_size,
+            distance_factor=4.0,
+            fov_degrees=60.0  # 减小FOV来"放大"主体
+        )
+        K = camera_params['intrinsics']
+        R = camera_params['rotation_matrix']
+        T = camera_params['camera_position']
+        scene_center = np.mean(all_vertices, axis=0).reshape(3, 1)
 
         R_np = R.cpu().numpy() if torch.is_tensor(R) else np.array(R)
         T_np = T.cpu().numpy() if torch.is_tensor(T) else np.array(T)
         if T_np.ndim == 1:
             T_np = T_np.reshape(3, 1)
-        original_camera_pos = -R_np.T @ T_np
+        original_camera_pos = T_np
 
-        camera_self_rotation = rotate_camera(rotation_angle, rotation_axis)
+        camera_self_rotation = rotate_camera(-rotation_angle, rotation_axis)
         rotated_R = R_np @ camera_self_rotation
         
         world_rotation_matrix = rotate_camera(rotation_angle, rotation_axis)
-        camera_relative = original_camera_pos - object_center
+        camera_relative = original_camera_pos - scene_center
         rotated_camera_relative = world_rotation_matrix @ camera_relative
-        new_camera_pos = rotated_camera_relative + object_center
+        new_camera_pos = rotated_camera_relative + scene_center
         final_R = rotated_R
         final_T = new_camera_pos.flatten()
+        # flip_rotation = rotate_camera(180, 'z')
+        # final_R = final_R @ flip_rotation
 
         extrinsic_matrix = np.eye(4)
         extrinsic_matrix[:3, :3] = final_R
@@ -1278,7 +1298,7 @@ class VideoBodyObjectOptimizer:
             mesh.translate(t)
             return mesh
 
-        camera_pyramid_length = np.linalg.norm(object_center) * 0.12  
+        camera_pyramid_length = np.linalg.norm(scene_center) * 0.12  
         camera_pyramid_base = camera_pyramid_length * 0.66          
 
         orig_pyramid = create_camera_pyramid(camera_pyramid_length, camera_pyramid_base)
@@ -1296,10 +1316,10 @@ class VideoBodyObjectOptimizer:
         camera = o3d.camera.PinholeCameraIntrinsic(
             width=render_size,
             height=render_size,
-            fx=K_np[0, 0] * (render_size / self.image_size),
-            fy=K_np[1, 1] * (render_size / self.image_size),
-            cx=K_np[0, 2] * (render_size / self.image_size),
-            cy=K_np[1, 2] * (render_size / self.image_size)
+            fx=K_np[0, 0],
+            fy=K_np[1, 1],
+            cx=K_np[0, 2],
+            cy=K_np[1, 2]
         )
         # original_distance = np.linalg.norm(original_camera_pos - object_center)
         # new_distance = np.linalg.norm(new_camera_pos - object_center)
@@ -1319,8 +1339,11 @@ class VideoBodyObjectOptimizer:
 
         for i in tqdm(range(0, self.seq_length, 2), desc=f"Processing frames with {rotation_angle}° rotation"):
 
-            human_verts = self.get_body_points(i, sampled=False).detach()
+            human_verts = self.get_body_points(i, sampled=False).detach().cpu().numpy()
             object_vertices = self.get_object_points(i, sampled=True).detach().cpu().numpy()
+            incam_params = (self.global_orient[i], self.transl[i])
+            global_params = (self.global_body_params["global_orient"][i], self.global_body_params["transl"][i])
+            human_verts, object_vertices = transform_to_global(human_verts, object_vertices, incam_params, global_params)
 
             # transform to global
 
