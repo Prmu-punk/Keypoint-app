@@ -12,6 +12,8 @@ from scipy.spatial.transform import Rotation as R
 from .utils.hoi_utils import load_transformation_matrix
 from copy import deepcopy
 from icppnp import solve_weighted_priority
+from .utils.camera_utils import transform_to_global
+
 def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
@@ -271,20 +273,28 @@ class HOISolver:
 
         return target_joints, constraint_joints
 
-    def solve_hoi(self, obj_init, obj_sample_init, body_params,i,start_frame, end_frame,hand_poses,
-                         object_points_idx, body_points_idx, object_points, image_points, K, joint_mapping,
-                         part_kp_file=resource_path("video_optimizer/data/part_kp.json"), save_meshes=False):
+    def solve_hoi(self, obj_init, obj_sample_init, body_params, global_body_params, i, start_frame, end_frame, hand_poses,
+                  object_points_idx, body_points_idx, object_points, image_points, joint_mapping, K=None,
+                  part_kp_file=resource_path("video_optimizer/data/part_kp.json"), save_meshes=False, all_mutiview_info=None, is_multiview=False):
         """
         直接求解HOI，输入预处理的物体和人体参数
         Args:
             obj_init: 原始物体网格
             obj_sample_init: 采样的物体网格
-            human_params: 人体参数字典，包含body_pose, globalv_orient, betas, transl
+            body_params: 包含多帧信息的人体参数字典
+            i: 当前帧在序列中的索引
+            start_frame, end_frame: 帧范围
+            hand_poses: 手部姿态
             object_points_idx: 物体点索引
             body_points_idx: 人体点索引
+            object_points: 用于2D-3D对应的物体点
+            image_points: 用于2D-3D对应的图像点
+            K: 相机内参
             joint_mapping: 关节映射字典
             part_kp_file: 人体关键点文件路径
             save_meshes: 是否保存网格文件
+            is_multiview: 是否为多视角优化
+            cam_params: 多视角相机的参数 (K, R, T)
         """
         print("Starting HOI solving with direct inputs...")
 
@@ -301,9 +311,7 @@ class HOISolver:
         output = self.model(betas=shape,
                          body_pose=body_pose,
                          left_hand_pose=torch.from_numpy(left_hand_pose).float().cuda(),
-                         # left_hand_pose=left_hand_pose,
                          right_hand_pose=torch.from_numpy(right_hand_pose).float().cuda(),
-                         # right_hand_pose=right_hand_pose,
                          jaw_pose=zero_pose,
                          leye_pose=zero_pose,
                          reye_pose=zero_pose,
@@ -321,28 +329,26 @@ class HOISolver:
         body_points_idx = body_points_idx[i]
         object_points = object_points[i]
         image_points = image_points[i]
+
         time1 = time.time()
         print("Starting ICP alignment...")
         corresp = self.get_corresponding_point(object_points_idx, body_points_idx, hpoints, obj_init)
         print(f"Correspondence points shape: {corresp['body_points'].shape}")
 
-        source_points = np.asarray(corresp['object_points'])
-        target_points = np.asarray(corresp['body_points'])
-        R_opt, t_opt = solve_weighted_priority(source_points, target_points, object_points, image_points, K, weight_3d=900.0, weight_2d=3.0)
+        source_points_3d = np.asarray(corresp['object_points'])
+        target_points_3d = np.asarray(corresp['body_points'])
 
+        if is_multiview:
+            incam_params = (body_params["global_orient"][i], body_params["transl"][i])
+            global_params = (global_body_params["global_orient"][i], global_body_params["transl"][i])
+        else:
+            incam_params = None
+            global_params = None
+        R_opt, t_opt = solve_weighted_priority(incam_params, global_params, source_points_3d, target_points_3d, object_points, image_points, K, all_mutiview_info, weight_3d=900.0, weight_2d=3.0)
         # 对物体应用变换
         transform_matrix = np.eye(4)
         transform_matrix[:3, :3] = R_opt
         transform_matrix[:3, 3] = t_opt.flatten()
-        # obj_init.transform(transform_matrix)
-        # obj_sample_init.transform(transform_matrix)
-        # org_overts = np.asarray(obj_init.vertices)
-        # org_overts_h = np.hstack([org_overts, np.ones((org_overts.shape[0], 1))])
-        # transformed_org_o = (T_est @ org_overts_h.T).T[:, :3]
-
-        # org_sample_verts = np.asarray(obj_sample_init.vertices)
-        # org_overts_h_sample = np.hstack([org_sample_verts, np.ones((org_sample_verts.shape[0], 1))])
-        # transformed_overts_sample = (T_est @ org_overts_h_sample.T).T[:, :3]
 
         if save_meshes:
             o3d.io.write_triangle_mesh("object_after_icp.obj", obj_sample_init)
@@ -359,7 +365,7 @@ class HOISolver:
             print(f"Constraint joints: {constraint_joints}")
 
             # 获取ICP后的物体对应点位置
-            transformed_obj_points = (transform_matrix @ np.hstack([source_points, np.ones((source_points.shape[0], 1))]).T).T[:,
+            transformed_obj_points = (transform_matrix @ np.hstack([source_points_3d, np.ones((source_points_3d.shape[0], 1))]).T).T[:,
                                      :3]
 
             # 获取当前人体关节位置

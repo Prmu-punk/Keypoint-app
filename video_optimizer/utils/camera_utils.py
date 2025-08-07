@@ -15,7 +15,7 @@ import numpy as np
 # from graphics_utils import fov2focal
 from scipy.spatial.transform import Rotation
 import open3d as o3d
-
+import math
 WARNED = False
 
 # def loadCam(args, id, cam_info, resolution_scale):
@@ -112,27 +112,48 @@ def apply_transform_to_model(vertices, transform_matrix):
     homogenous_verts = np.hstack([vertices, np.ones((len(vertices), 1))])
     transformed = (transform_matrix @ homogenous_verts.T).T
     return transformed[:, :3] / transformed[:, [3]]
-
-def transform_to_global(hverts, overts, incam_params, global_params):
+def rotate_camera(rotation_angle, rotation_axis):
+    camera_rotation_rad = math.radians(rotation_angle)
+    if rotation_axis.lower() == 'y':
+        camera_self_rotation = np.array([
+            [math.cos(camera_rotation_rad), 0, math.sin(camera_rotation_rad)],
+            [0, 1, 0],
+            [-math.sin(camera_rotation_rad), 0, math.cos(camera_rotation_rad)]
+        ])
+    elif rotation_axis.lower() == 'x':
+        camera_self_rotation = np.array([
+            [1, 0, 0],
+            [0, math.cos(camera_rotation_rad), -math.sin(camera_rotation_rad)],
+            [0, math.sin(camera_rotation_rad), math.cos(camera_rotation_rad)]
+        ])
+    elif rotation_axis.lower() == 'z':
+        camera_self_rotation = np.array([
+            [math.cos(camera_rotation_rad), -math.sin(camera_rotation_rad), 0],
+            [math.sin(camera_rotation_rad), math.cos(camera_rotation_rad), 0],
+            [0, 0, 1]
+        ])
+    return camera_self_rotation
+def transform_to_global(incam_params, global_params, hverts=None, overts=None):
     incam_orient, incam_trans = incam_params
     global_orient, global_trans = global_params
     axis_angle = incam_orient.detach().cpu().numpy()
-    R_2ori = Rotation.from_rotvec(axis_angle).as_matrix()
-    T_2ori = incam_trans.detach().cpu().numpy().squeeze()
+    R_2ori = Rotation.from_rotvec(axis_angle).as_matrix().reshape(3, 3)
+    T_2ori = incam_trans.detach().cpu().numpy().squeeze().copy()
     T_2ori[1] -= 0.7
     T_2ori[0] += 0.13
 
     transformation_matrix = np.eye(4)
     transformation_matrix[:3, :3] = R_2ori.T
     transformation_matrix[:3, 3] = - R_2ori.T @ T_2ori
-
-    hverts = apply_transform_to_model(hverts, transformation_matrix)
-    overts = apply_transform_to_model(overts, transformation_matrix)
+    if hverts is not None:
+        hverts = apply_transform_to_model(hverts, transformation_matrix)
+    if overts is not None:
+        overts = apply_transform_to_model(overts, transformation_matrix)
 
 
     axis_angle = global_orient.cpu().numpy()
     global_R = Rotation.from_rotvec(axis_angle).as_matrix()
-    global_T = global_trans.cpu().numpy()
+    global_T = global_trans.cpu().numpy().copy()
     global_T[0] -= 0.12
     global_T[1] -= 0.01
     global_T[2] += 0.03
@@ -140,9 +161,11 @@ def transform_to_global(hverts, overts, incam_params, global_params):
     transformation_matrix = np.eye(4)
     transformation_matrix[:3, :3] = global_R
     transformation_matrix[:3, 3] = global_T
-    human_verts = apply_transform_to_model(hverts, transformation_matrix)
-    object_vertices = apply_transform_to_model(overts, transformation_matrix)
-    return human_verts, object_vertices
+    if hverts is not None:
+        hverts = apply_transform_to_model(hverts, transformation_matrix)
+    if overts is not None:
+        overts = apply_transform_to_model(overts, transformation_matrix)
+    return hverts, overts
 
 def compute_bounding_box(vertices):
     min_coords = np.min(vertices, axis=0)
@@ -215,14 +238,7 @@ def compute_camera_intrinsics(bbox_size, image_width, image_height, fov_degrees=
     return intrinsics
 
 def create_camera_for_object(vertices, image_width=800, image_height=600, ground_plane='xz', distance_factor=3.0, fov_degrees=60.0):
-    """
-    添加distance_factor参数来控制相机距离
-    添加fov_degrees参数来控制相机的视野（FOV）
-    distance_factor=2.0: 较近
-    distance_factor=3.0: 中等距离（默认）
-    distance_factor=4.0: 较远
-    distance_factor=5.0: 很远
-    """
+
     min_coords, max_coords, center, size = compute_bounding_box(vertices)
     camera_position = compute_camera_position(center, size, ground_plane, distance_factor)
     extrinsics, rotation_matrix, camera_pos = compute_camera_extrinsics(camera_position, center)
@@ -242,122 +258,3 @@ def create_camera_for_object(vertices, image_width=800, image_height=600, ground
         }
     }
 
-# def test_camera():
-#     """测试相机函数"""
-    
-#     # 创建测试数据
-#     hverts = np.array([
-#         [-0.2, 1.8, -0.2], [0.2, 1.8, -0.2], [0.2, 2.0, -0.2], [-0.2, 2.0, -0.2],
-#         [-0.2, 1.8, 0.2], [0.2, 1.8, 0.2], [0.2, 2.0, 0.2], [-0.2, 2.0, 0.2],
-#         [-0.3, 0.0, -0.15], [0.3, 0.0, -0.15], [0.3, 1.8, -0.15], [-0.3, 1.8, -0.15],
-#         [-0.3, 0.0, 0.15], [0.3, 0.0, 0.15], [0.3, 1.8, 0.15], [-0.3, 1.8, 0.15],
-#     ])
-    
-#     overts = np.array([
-#         [1.0, 0.0, 1.0], [2.0, 0.0, 1.0], [2.0, 1.0, 1.0], [1.0, 1.0, 1.0],
-#         [1.0, 0.0, 2.0], [2.0, 0.0, 2.0], [2.0, 1.0, 2.0], [1.0, 1.0, 2.0],
-#     ])
-    
-#     vertices = np.concatenate([hverts, overts], axis=0)
-    
-#     # 调整这里的distance_factor来控制相机距离
-#     # 可以尝试 4.0, 5.0, 6.0 等更大的值
-#     camera_params = create_camera_for_object(vertices, distance_factor=4.0)
-    
-#     print("=== 相机参数调试 ===")
-#     print(f"相机位置: {camera_params['camera_position']}")
-#     print(f"目标位置: {camera_params['target_position']}")
-#     print(f"包围盒大小: {camera_params['bounding_box']['size']}")
-    
-#     # 计算相机到目标的距离
-#     distance = np.linalg.norm(camera_params['camera_position'] - camera_params['target_position'])
-#     print(f"相机距离: {distance:.2f}")
-    
-#     # 转换为Open3D相机
-#     intrinsic = o3d.camera.PinholeCameraIntrinsic()
-#     intrinsic.set_intrinsics(800, 600,
-#                            camera_params['intrinsics'][0,0],
-#                            camera_params['intrinsics'][1,1],
-#                            camera_params['intrinsics'][0,2],
-#                            camera_params['intrinsics'][1,2])
-    
-#     extrinsic = np.eye(4)
-#     extrinsic[:3, :] = camera_params['extrinsics']
-    
-#     camera = o3d.camera.PinholeCameraParameters()
-#     camera.intrinsic = intrinsic
-#     camera.extrinsic = extrinsic
-    
-#     # 创建几何体
-#     human_mesh = o3d.geometry.TriangleMesh.create_box(0.6, 2.0, 0.4)
-#     human_mesh.translate([-0.3, 0, -0.2])
-#     human_mesh.paint_uniform_color([0, 1, 0])
-#     human_mesh.compute_vertex_normals()
-    
-#     object_mesh = o3d.geometry.TriangleMesh.create_box(1.0, 1.0, 1.0)
-#     object_mesh.translate([1.0, 0, 1.0])  
-#     object_mesh.paint_uniform_color([1, 0, 0])
-#     object_mesh.compute_vertex_normals()
-    
-#     ground = o3d.geometry.TriangleMesh.create_box(4.0, 0.1, 4.0)
-#     ground.translate([-1.0, -0.1, -1.0])
-#     ground.paint_uniform_color([0.5, 0.5, 0.5])
-#     ground.compute_vertex_normals()
-    
-#     coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
-    
-#     # 创建相机位置标记
-#     camera_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.1)
-#     camera_marker.translate(camera_params['camera_position'])
-#     camera_marker.paint_uniform_color([1, 0, 1])  # 紫色
-#     camera_marker.compute_vertex_normals()
-    
-#     # 创建目标标记
-#     target_marker = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
-#     target_marker.translate(camera_params['target_position'])
-#     target_marker.paint_uniform_color([1, 1, 0])  # 黄色
-#     target_marker.compute_vertex_normals()
-    
-#     # 启动可视化器
-#     vis = o3d.visualization.Visualizer()
-#     vis.create_window(width=800, height=600, window_name="Camera Test - Distance Factor 4.0")
-    
-#     vis.add_geometry(human_mesh)
-#     vis.add_geometry(object_mesh)
-#     vis.add_geometry(ground)
-#     vis.add_geometry(coord_frame)
-#     vis.add_geometry(camera_marker)
-#     vis.add_geometry(target_marker)
-    
-#     # 先显示默认视角
-#     print("\n显示默认视角（3秒后切换到相机视角）")
-#     vis.poll_events()
-#     vis.update_renderer()
-    
-#     import time
-#     for i in range(3, 0, -1):
-#         print(f"切换倒计时: {i}秒")
-#         time.sleep(1)
-    
-#     # 应用相机参数
-#     print("应用相机参数...")
-#     view_control = vis.get_view_control()
-#     view_control.convert_from_pinhole_camera_parameters(camera, allow_arbitrary=True)
-    
-#     vis.poll_events()
-#     vis.update_renderer()
-    
-#     print("渲染窗口已打开，按Q键关闭")
-#     print(f"当前距离因子: 4.0，相机距离: {distance:.2f}")
-#     print("可以尝试的距离因子:")
-#     print("- 2.0: 很近")
-#     print("- 3.0: 中等") 
-#     print("- 4.0: 较远（当前）")
-#     print("- 5.0: 很远")
-#     print("- 6.0: 超远")
-    
-#     vis.run()
-#     vis.destroy_window()
-
-# if __name__ == "__main__":
-#     test_camera()

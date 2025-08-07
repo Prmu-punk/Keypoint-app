@@ -38,6 +38,7 @@ from scipy.ndimage.morphology import distance_transform_edt
 from pykalman import KalmanFilter
 from .utils.camera_utils import create_camera_for_object, transform_to_global
 import gtsam
+from .utils.vis.renderer import Renderer, get_global_cameras_static, get_ground_params_from_points
 
 def resource_path(relative_path):
     try:
@@ -71,7 +72,9 @@ class VideoBodyObjectOptimizer:
                  pairs_2d, 
                  object_meshes, 
                  sampled_obj_meshes,
-                 centers,
+                #  centers,
+                 initial_R,
+                 initial_t,
                  transform_matrix,
                  smpl_model,
                  start_frame,
@@ -99,7 +102,9 @@ class VideoBodyObjectOptimizer:
         self.hand_poses = hand_params
         self.object_meshes = object_meshes
         self.sampled_obj_meshes = sampled_obj_meshes
-        self.centers = centers
+        # self.centers = centers
+        self.initial_R = initial_R
+        self.centers = initial_t
         self.transform_matrix = transform_matrix
         self.video_dir = video_dir
         self.is_static_object = is_static_object
@@ -107,6 +112,8 @@ class VideoBodyObjectOptimizer:
         cap = cv2.VideoCapture(os.path.join(video_dir, "video.mp4"))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.width = width
+        self.height = height
         self.image_size = max(width, height)
         self.lr = lr
         # self.obj_scale = nn.Parameter(torch.tensor(1.0).float().cuda(), requires_grad=True)
@@ -312,26 +319,18 @@ class VideoBodyObjectOptimizer:
             frame_idx = self.current_frame
         if self.is_static_object:
             frame_idx = 0
+        
         if sampled:
             object_mesh = self.sampled_obj_meshes[frame_idx]
         else:
             object_mesh = self.object_meshes[frame_idx]
-        R_residual = self.get_object_transform(frame_idx)
-        R_base = self.base_obj_R[frame_idx]
-        R_final = torch.mm(R_residual, R_base)
 
-        t_residual = self.obj_transl_params[frame_idx]
-        t_base = self.base_obj_transl[frame_idx]
+        R_final, t_final = self.get_object_params(frame_idx)
         
-        # Correctly compose the final translation by applying the residual rotation to the base translation.
-        # t_final = R_residual * t_base + t_residual
-        centers = torch.tensor(self.centers[frame_idx], dtype=torch.float32, device=R_final.device)
-        t_final = torch.mv(R_residual, t_base) + torch.mv(R_final, centers) + t_residual
-
         object_points = torch.tensor(np.asarray(object_mesh.vertices), 
                                    dtype=torch.float32, device=R_final.device)
 
-        # v' = (R_final @ v.T).T + t_final = v @ R_final.T + t_final
+        # v' = v @ R_final.T + t_final
         object_points = torch.mm(object_points, R_final.T) + t_final
         
         return object_points
@@ -372,6 +371,63 @@ class VideoBodyObjectOptimizer:
         # 组合旋转矩阵  
         R = torch.mm(torch.mm(RZ, RY), RX)  
         return R  
+    
+    def get_optimized_parameters(self):
+        """
+        获取优化后的所有参数
+        :return: 包含人体参数和物体参数的字典
+        """
+        human_params = {
+            'body_pose': [],
+            'betas': [],
+            'global_orient': [],
+            'transl': [],
+            'left_hand_pose': [],
+            'right_hand_pose': [],
+        }
+        
+        object_params = {
+            'poses': [],  # R_final
+            'centers': []  # t_final
+        }
+        
+        # 收集所有帧的参数
+        for frame_idx in range(self.seq_length):
+            # 人体参数
+            body_pose = self.body_pose_params[frame_idx].reshape(1, -1).cpu().detach().numpy()
+            shape = self.shape_params[frame_idx].reshape(1, -1).cpu().detach().numpy()
+            global_orient = self.global_orient[frame_idx].reshape(1, 3).cpu().detach().numpy()
+            left_hand_pose = self.left_hand_params[frame_idx].reshape(1, -1).cpu().detach().numpy()
+            right_hand_pose = self.right_hand_params[frame_idx].reshape(1, -1).cpu().detach().numpy()
+            transl = self.transl[frame_idx].reshape(1, -1).cpu().detach().numpy()
+            
+            human_params['body_pose'].append(body_pose.tolist())
+            human_params['betas'].append(shape.tolist())
+            human_params['global_orient'].append(global_orient.tolist())
+            human_params['transl'].append(transl.tolist())
+            human_params['left_hand_pose'].append(left_hand_pose.tolist())
+            human_params['right_hand_pose'].append(right_hand_pose.tolist())
+            
+            # 物体参数 - 获取R_final和t_final
+            if self.is_static_object:
+                obj_frame_idx = 0
+            else:
+                obj_frame_idx = frame_idx
+                
+            # 计算R_final和t_final (参考get_object_points方法)
+            R_final, t_final = self.get_object_params(obj_frame_idx)
+            
+            object_params['poses'].append(R_final.cpu().detach().numpy().tolist())
+            object_params['centers'].append(t_final.cpu().detach().numpy().tolist())
+        
+        return {
+            'human_params': human_params,
+            'object_params': object_params,
+            'frame_range': {
+                'start_frame': self.start_frame,
+                'end_frame': self.end_frame
+            }
+        }
     
     def get_corresponding_point(self, frame_idx=None):  
         """  
@@ -1001,8 +1057,8 @@ class VideoBodyObjectOptimizer:
 
             if not self.is_static_object and optimize_interval > 1 :
                 self._interpolate_frames(optimize_interval)
-            self.save_sequence(os.path.join(self.video_dir, "optimized_sequence"))
-            # time2 = time.time()
+            # self.save_sequence(os.path.join(self.video_dir, "optimized_sequence"))
+            time2 = time.time()
             # print(f"optimize time: {time2 - time0}")
             # self._post_process_smoothing(smooth_steps=30, smooth_lr=0.001)
             self._kalman_smoothing()
@@ -1059,14 +1115,14 @@ class VideoBodyObjectOptimizer:
                 for i in range(self.seq_length):
                     R_base = self.base_obj_R[i].cpu().numpy()
                     R_residual = final_R_list_cpu[i]
-                    R_final = R_residual @ R_base
+                    R_final_no_initial = R_residual @ R_base
+                    R_final = R_final_no_initial @ self.initial_R[i]
 
                     t_base = t_base_list_cpu[i]
                     t_residual = t_residual_list_cpu[i]
-                    t_final = R_residual @ t_base + t_residual
                     
                     center = centers_cpu[i]
-                    effective_translation = R_final @ center + t_final
+                    effective_translation = R_final_no_initial @ center + R_residual @ t_base + t_residual
 
                     pose_gtsam = gtsam.Pose3(gtsam.Rot3(R_final), effective_translation)
                     pose_seq_gtsam.append(pose_gtsam)
@@ -1080,29 +1136,7 @@ class VideoBodyObjectOptimizer:
                 
                 if not twists: 
                     return
-                # original_twists_np = np.array([p.data.cpu().numpy() for p in twists])
-                apply_kalman(twists, observation_weight=4, transition_cov=1, param_name="twists")
-                # smoothed_twists_np = np.array([p.data.cpu().numpy() for p in twists])
-
-                # fig, axs = plt.subplots(6, 1, figsize=(15, 20), sharex=True)
-                # fig.suptitle('Twist (se3) Smoothing Comparison', fontsize=16)
-                # twist_labels = ['Rot X', 'Rot Y', 'Rot Z', 'Trans X', 'Trans Y', 'Trans Z']
-                # time_steps = range(len(twists))
-
-                # for i in range(6):
-                #     axs[i].plot(time_steps, original_twists_np[:, i], 'r-o', label='Original', alpha=0.7, markersize=4)
-                #     axs[i].plot(time_steps, smoothed_twists_np[:, i], 'b-o', label='Smoothed', alpha=0.7, markersize=4)
-                #     axs[i].set_ylabel(twist_labels[i])
-                #     axs[i].legend()
-                #     axs[i].grid(True)
-                
-                # axs[5].set_xlabel('Frame-to-Frame Step')
-                # plt.tight_layout(rect=[0, 0, 1, 0.96])
-                # plot_path = os.path.join(self.video_dir, 'twists_smoothing_visualization.png')
-                # plt.savefig(plot_path)
-                # plt.close(fig)
-                # tqdm.write(f"Saved twist smoothing visualization to {plot_path}")
-
+                apply_kalman(twists, observation_weight=3, transition_cov=0.1, param_name="twists")
                 smoothed_poses_gtsam = [pose_seq_gtsam[0]]
                 for i in range(len(twists)):
                     smoothed_twist_np = twists[i].data.numpy()
@@ -1115,10 +1149,18 @@ class VideoBodyObjectOptimizer:
                 
                 device = self.obj_x_params[0].device
                 smoothed_final_R_stack = torch.from_numpy(np.array(smoothed_final_R_list)).float().to(device)
+                smoothed_effective_transl_list = [p.translation() for p in smoothed_poses_gtsam]
+                
+                device = self.obj_x_params[0].device
+                smoothed_final_R_stack = torch.from_numpy(np.array(smoothed_final_R_list)).float().to(device)
                 smoothed_effective_transl = torch.from_numpy(np.array(smoothed_effective_transl_list)).float().to(device)
 
                 base_R_inv_stack = torch.stack(self.base_obj_R).transpose(1, 2)
-                new_residual_R_stack = torch.matmul(smoothed_final_R_stack, base_R_inv_stack)
+                initial_R_stack = torch.from_numpy(np.array(self.initial_R)).float().to(device)
+                initial_R_inv_tensor = initial_R_stack.transpose(1, 2)
+                
+                smoothed_final_R_no_initial_stack = torch.matmul(smoothed_final_R_stack, initial_R_inv_tensor)
+                new_residual_R_stack = torch.matmul(smoothed_final_R_no_initial_stack, base_R_inv_stack)
                 new_residual_euler_rad = matrix_to_euler_angles(new_residual_R_stack, "ZYX")
                 new_residual_euler_deg = torch.rad2deg(new_residual_euler_rad)
 
@@ -1129,7 +1171,7 @@ class VideoBodyObjectOptimizer:
                 centers_stack = torch.tensor(self.centers, device=device, dtype=torch.float32)
                 base_t_stack = torch.stack(self.base_obj_transl)
 
-                rotated_centers = torch.bmm(smoothed_final_R_stack, centers_stack.unsqueeze(-1)).squeeze(-1)
+                rotated_centers = torch.bmm(smoothed_final_R_no_initial_stack, centers_stack.unsqueeze(-1)).squeeze(-1)
                 new_t_final = smoothed_effective_transl - rotated_centers
                 
                 rotated_base_t = torch.bmm(new_residual_R_stack, base_t_stack.unsqueeze(-1)).squeeze(-1)
@@ -1188,184 +1230,218 @@ class VideoBodyObjectOptimizer:
             line_set.colors = o3d.utility.Vector3dVector(colors)  
             o3d.io.write_line_set(os.path.join(frame_dir, 'contact_points.ply'), line_set)  
     
-    def create_visualization_video(self, output_dir, K, R, T, video_path=None, fps=3, 
-                                            rotation_angle=0, rotation_axis='y'):    
+    # def create_visualization_video(self, output_dir, K, R, T, video_path=None, fps=3,
+    #                                         rotation_angle=0, rotation_axis='y'):
+    #
+    #     def rotate_camera(rotation_angle, rotation_axis):
+    #         camera_rotation_rad = math.radians(rotation_angle)
+    #         if rotation_axis.lower() == 'y':
+    #             camera_self_rotation = np.array([
+    #                 [math.cos(camera_rotation_rad), 0, math.sin(camera_rotation_rad)],
+    #                 [0, 1, 0],
+    #                 [-math.sin(camera_rotation_rad), 0, math.cos(camera_rotation_rad)]
+    #             ])
+    #         elif rotation_axis.lower() == 'x':
+    #             camera_self_rotation = np.array([
+    #                 [1, 0, 0],
+    #                 [0, math.cos(camera_rotation_rad), -math.sin(camera_rotation_rad)],
+    #                 [0, math.sin(camera_rotation_rad), math.cos(camera_rotation_rad)]
+    #             ])
+    #         elif rotation_axis.lower() == 'z':
+    #             camera_self_rotation = np.array([
+    #                 [math.cos(camera_rotation_rad), -math.sin(camera_rotation_rad), 0],
+    #                 [math.sin(camera_rotation_rad), math.cos(camera_rotation_rad), 0],
+    #                 [0, 0, 1]
+    #             ])
+    #         return camera_self_rotation
+    #     os.makedirs(output_dir, exist_ok=True)
+    #
+    #     # ===== 渲染设置 =====
+    #     render_size = self.image_size // 3
+    #     render = o3d.visualization.rendering.OffscreenRenderer(render_size, render_size)
+    #     render.scene.set_background([1.0, 1.0, 1.0, 1.0])
+    #     human_mat = o3d.visualization.rendering.MaterialRecord()
+    #     human_mat.base_color = [0.7, 0.3, 0.3, 1.0]
+    #     human_mat.shader = "defaultLit"
+    #
+    #     object_mat = o3d.visualization.rendering.MaterialRecord()
+    #     object_mat.base_color = [0.3, 0.5, 0.7, 1.0]
+    #     object_mat.shader = "defaultLit"
+    #
+    #     middle_frame = self.seq_length // 2
+    #     self.current_frame = middle_frame
+    #     object_vertices = self.get_object_points(middle_frame, sampled=True).detach().cpu().numpy()
+    #     human_vertices = self.get_body_points(middle_frame, sampled=False).detach().cpu().numpy()
+    #     incam_params = (self.global_orient[middle_frame], self.transl[middle_frame])
+    #     global_params = (self.global_body_params["global_orient"][middle_frame], self.global_body_params["transl"][middle_frame])
+    #     human_vertices, object_vertices = transform_to_global(human_vertices, object_vertices, incam_params, global_params)
+    #     all_vertices = np.vstack((human_vertices, object_vertices))
+    #     camera_params = create_camera_for_object(
+    #         all_vertices,
+    #         image_width=render_size,
+    #         image_height=render_size,
+    #         distance_factor=4.0,
+    #         fov_degrees=60.0  # 减小FOV来"放大"主体
+    #     )
+    #     K = camera_params['intrinsics']
+    #     R = camera_params['rotation_matrix']
+    #     T = camera_params['camera_position']
+    #     scene_center = np.mean(all_vertices, axis=0).reshape(3, 1)
+    #
+    #     R_np = R.cpu().numpy() if torch.is_tensor(R) else np.array(R)
+    #     T_np = T.cpu().numpy() if torch.is_tensor(T) else np.array(T)
+    #     if T_np.ndim == 1:
+    #         T_np = T_np.reshape(3, 1)
+    #     original_camera_pos = T_np
+    #
+    #     camera_self_rotation = rotate_camera(-rotation_angle, rotation_axis)
+    #     rotated_R = R_np @ camera_self_rotation
+    #
+    #     world_rotation_matrix = rotate_camera(rotation_angle, rotation_axis)
+    #     camera_relative = original_camera_pos - scene_center
+    #     rotated_camera_relative = world_rotation_matrix @ camera_relative
+    #     new_camera_pos = rotated_camera_relative + scene_center
+    #     final_R = rotated_R
+    #     final_T = new_camera_pos.flatten()
+    #     # flip_rotation = rotate_camera(180, 'z')
+    #     # final_R = final_R @ flip_rotation
+    #
+    #     extrinsic_matrix = np.eye(4)
+    #     extrinsic_matrix[:3, :3] = final_R
+    #     extrinsic_matrix[:3, 3] = final_T
+    #     view_matrix = np.linalg.inv(extrinsic_matrix)
+    #     def create_camera_pyramid(length=0.03, base=0.02):
+    #         # 顶点数据：锥体的尖端+底面4点
+    #         tip = np.array([[0, 0, length]])
+    #         half = base / 2
+    #         base_pts = np.array([
+    #             [ half,  half, 0],
+    #             [-half,  half, 0],
+    #             [-half, -half, 0],
+    #             [ half, -half, 0]
+    #         ])
+    #         vertices = np.vstack([tip, base_pts])
+    #         triangles = np.array([
+    #             [0, 1, 2],
+    #             [0, 2, 3],
+    #             [0, 3, 4],
+    #             [0, 4, 1],
+    #             [1, 2, 3],
+    #             [1, 3, 4]
+    #         ])
+    #         mesh = o3d.geometry.TriangleMesh()
+    #         mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    #         mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    #         mesh.compute_vertex_normals()
+    #         return mesh
+    #
+    #     def apply_transform(mesh, R, t):
+    #         mesh.rotate(R, center=np.zeros(3))
+    #         mesh.translate(t)
+    #         return mesh
+    #
+    #     camera_pyramid_length = np.linalg.norm(scene_center) * 0.12
+    #     camera_pyramid_base = camera_pyramid_length * 0.66
+    #
+    #     orig_pyramid = create_camera_pyramid(camera_pyramid_length, camera_pyramid_base)
+    #     orig_pyramid.paint_uniform_color([1.0, 0.2, 0.2])  # 红色
+    #     orig_pyramid = apply_transform(orig_pyramid, R_np, original_camera_pos.flatten())
+    #     o3d.io.write_triangle_mesh(os.path.join(output_dir, "camera_original.obj"), orig_pyramid)
+    #
+    #     rotated_pyramid = create_camera_pyramid(camera_pyramid_length, camera_pyramid_base)
+    #     rotated_pyramid.paint_uniform_color([0.2, 0.4, 1.0])  # 蓝色
+    #     rotated_pyramid = apply_transform(rotated_pyramid, final_R, new_camera_pos.flatten())
+    #     o3d.io.write_triangle_mesh(os.path.join(output_dir, "camera_rotated.obj"), rotated_pyramid)
+    #     # End of 相机可视化
+    #
+    #     K_np = K.cpu().numpy() if torch.is_tensor(K) else np.array(K)
+    #     camera = o3d.camera.PinholeCameraIntrinsic(
+    #         width=render_size,
+    #         height=render_size,
+    #         fx=K_np[0, 0],
+    #         fy=K_np[1, 1],
+    #         cx=K_np[0, 2],
+    #         cy=K_np[1, 2]
+    #     )
+    #     # original_distance = np.linalg.norm(original_camera_pos - object_center)
+    #     # new_distance = np.linalg.norm(new_camera_pos - object_center)
+    #     # print(f"原始相机到物体距离: {original_distance:.3f}")
+    #     # print(f"新相机到物体距离: {new_distance:.3f}")
+    #     # print(f"距离差异: {abs(original_distance - new_distance):.6f}")
+    #     # camera_forward = -final_R[2, :]
+    #     # to_object = (object_center.flatten() - new_camera_pos.flatten())
+    #     # to_object = to_object / np.linalg.norm(to_object)
+    #
+    #     # print(f"相机前向量: {camera_forward}")
+    #     # print(f"相机到物体方向: {to_object}")
+    #     # print(f"方向一致性 (dot product): {np.dot(camera_forward, to_object):.3f}")
+    #     os.makedirs(output_dir, exist_ok=True)
+    #     human_faces = np.array(self.get_body_faces(sampled=False), dtype=np.int32)
+    #
+    #
+    #     for i in tqdm(range(0, self.seq_length, 2), desc=f"Processing frames with {rotation_angle}° rotation"):
+    #
+    #         human_verts = self.get_body_points(i, sampled=False).detach().cpu().numpy()
+    #         object_vertices = self.get_object_points(i, sampled=True).detach().cpu().numpy()
+    #         incam_params = (self.global_orient[i], self.transl[i])
+    #         global_params = (self.global_body_params["global_orient"][i], self.global_body_params["transl"][i])
+    #         human_verts, object_vertices = transform_to_global(human_verts, object_vertices, incam_params, global_params)
+    #
+    #         # transform to global
+    #
+    #
+    #         render.scene.clear_geometry()
+    #         human_mesh = o3d.geometry.TriangleMesh()
+    #         human_mesh.vertices = o3d.utility.Vector3dVector(human_verts)
+    #         human_mesh.triangles = o3d.utility.Vector3iVector(human_faces)
+    #         human_mesh.compute_vertex_normals()
+    #
+    #         transformed_object_mesh = o3d.geometry.TriangleMesh()
+    #         transformed_object_mesh.vertices = o3d.utility.Vector3dVector(object_vertices)
+    #         transformed_object_mesh.triangles = o3d.utility.Vector3iVector(self.get_object_faces(i, sampled=True))
+    #         transformed_object_mesh.compute_vertex_normals()
+    #         render.scene.add_geometry("human", human_mesh, human_mat)
+    #         render.scene.add_geometry("object", transformed_object_mesh, object_mat)
+    #
+    #         render.setup_camera(camera, view_matrix)
+    #         rendered_img = render.render_to_image()
+    #         start_frame = (self.start_frame // 2) * 2
+    #         frame_path = os.path.join(output_dir, f"frame_{i+start_frame:04d}.png")
+    #         o3d.io.write_image(frame_path, rendered_img)
 
-        def rotate_camera(rotation_angle, rotation_axis):
-            camera_rotation_rad = math.radians(rotation_angle)
-            if rotation_axis.lower() == 'y':
-                camera_self_rotation = np.array([
-                    [math.cos(camera_rotation_rad), 0, math.sin(camera_rotation_rad)],
-                    [0, 1, 0],
-                    [-math.sin(camera_rotation_rad), 0, math.cos(camera_rotation_rad)]
-                ])
-            elif rotation_axis.lower() == 'x':
-                camera_self_rotation = np.array([
-                    [1, 0, 0],
-                    [0, math.cos(camera_rotation_rad), -math.sin(camera_rotation_rad)],
-                    [0, math.sin(camera_rotation_rad), math.cos(camera_rotation_rad)]
-                ])
-            elif rotation_axis.lower() == 'z':
-                camera_self_rotation = np.array([
-                    [math.cos(camera_rotation_rad), -math.sin(camera_rotation_rad), 0],
-                    [math.sin(camera_rotation_rad), math.cos(camera_rotation_rad), 0],
-                    [0, 0, 1]
-                ])
-            return camera_self_rotation
+    def create_visualization_video(self, output_dir, K, video_path=None, fps=3, clear=True):
+        if os.path.exists(output_dir) and clear:
+            shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
         os.makedirs(output_dir, exist_ok=True)
-        
-        # ===== 渲染设置 =====
-        render_size = self.image_size // 3
-        render = o3d.visualization.rendering.OffscreenRenderer(render_size, render_size)
-        render.scene.set_background([1.0, 1.0, 1.0, 1.0])
-        human_mat = o3d.visualization.rendering.MaterialRecord()
-        human_mat.base_color = [0.7, 0.3, 0.3, 1.0]
-        human_mat.shader = "defaultLit"
-        
-        object_mat = o3d.visualization.rendering.MaterialRecord()
-        object_mat.base_color = [0.3, 0.5, 0.7, 1.0]
-        object_mat.shader = "defaultLit"
+        human_faces = np.array(self.get_body_faces(sampled=True), dtype=np.int32)
+        obj_faces= np.array(self.sampled_obj_meshes[0].triangles, dtype=np.int32)
+        renderer = Renderer(self.width, self.height, device="cuda",faces_human=human_faces,faces_obj=obj_faces,K=K)
 
-        middle_frame = self.seq_length // 2
-        self.current_frame = middle_frame
-        object_vertices = self.get_object_points(middle_frame, sampled=True).detach().cpu().numpy()
-        human_vertices = self.get_body_points(middle_frame, sampled=False).detach().cpu().numpy()
-        incam_params = (self.global_orient[middle_frame], self.transl[middle_frame])
-        global_params = (self.global_body_params["global_orient"][middle_frame], self.global_body_params["transl"][middle_frame])
-        human_vertices, object_vertices = transform_to_global(human_vertices, object_vertices, incam_params, global_params)
-        all_vertices = np.vstack((human_vertices, object_vertices))
-        camera_params = create_camera_for_object(
-            all_vertices,
-            image_width=render_size,
-            image_height=render_size,
-            distance_factor=4.0,
-            fov_degrees=60.0  # 减小FOV来"放大"主体
-        )
-        K = camera_params['intrinsics']
-        R = camera_params['rotation_matrix']
-        T = camera_params['camera_position']
-        scene_center = np.mean(all_vertices, axis=0).reshape(3, 1)
+        for i in tqdm(range(0, self.seq_length, 2), desc="rendering frames"):
+            human_verts = self.get_body_points(i, sampled=True)
+            object_mesh = self.sampled_obj_meshes[i]
+            transform = self.get_object_transform(i).detach().cpu().numpy()
+            object_vertices = self.get_object_points(i,sampled=True)
+            # object_vertices=torch.from_numpy(object_vertices).float().cuda()
+            img_raw = np.ones((self.height, self.width, 3), dtype=np.uint8) * 255
 
-        R_np = R.cpu().numpy() if torch.is_tensor(R) else np.array(R)
-        T_np = T.cpu().numpy() if torch.is_tensor(T) else np.array(T)
-        if T_np.ndim == 1:
-            T_np = T_np.reshape(3, 1)
-        original_camera_pos = T_np
+            ## use object vertex color as object color, object_mesh.vertex_color
+            if hasattr(object_mesh, 'vertex_colors'):
+                object_color = np.asarray(object_mesh.vertex_colors)
+                print("object_color shape:", object_color.shape)
+            else:
+                object_color = [0.3, 0.5, 0.7]
 
-        camera_self_rotation = rotate_camera(-rotation_angle, rotation_axis)
-        rotated_R = R_np @ camera_self_rotation
-        
-        world_rotation_matrix = rotate_camera(rotation_angle, rotation_axis)
-        camera_relative = original_camera_pos - scene_center
-        rotated_camera_relative = world_rotation_matrix @ camera_relative
-        new_camera_pos = rotated_camera_relative + scene_center
-        final_R = rotated_R
-        final_T = new_camera_pos.flatten()
-        # flip_rotation = rotate_camera(180, 'z')
-        # final_R = final_R @ flip_rotation
-
-        extrinsic_matrix = np.eye(4)
-        extrinsic_matrix[:3, :3] = final_R
-        extrinsic_matrix[:3, 3] = final_T
-        view_matrix = np.linalg.inv(extrinsic_matrix)
-        def create_camera_pyramid(length=0.03, base=0.02):
-            # 顶点数据：锥体的尖端+底面4点
-            tip = np.array([[0, 0, length]])
-            half = base / 2
-            base_pts = np.array([
-                [ half,  half, 0],
-                [-half,  half, 0],
-                [-half, -half, 0],
-                [ half, -half, 0]
-            ])
-            vertices = np.vstack([tip, base_pts])
-            triangles = np.array([
-                [0, 1, 2],
-                [0, 2, 3],
-                [0, 3, 4],
-                [0, 4, 1],
-                [1, 2, 3],   
-                [1, 3, 4]    
-            ])
-            mesh = o3d.geometry.TriangleMesh()
-            mesh.vertices = o3d.utility.Vector3dVector(vertices)
-            mesh.triangles = o3d.utility.Vector3iVector(triangles)
-            mesh.compute_vertex_normals()
-            return mesh
-
-        def apply_transform(mesh, R, t):
-            mesh.rotate(R, center=np.zeros(3))
-            mesh.translate(t)
-            return mesh
-
-        camera_pyramid_length = np.linalg.norm(scene_center) * 0.12  
-        camera_pyramid_base = camera_pyramid_length * 0.66          
-
-        orig_pyramid = create_camera_pyramid(camera_pyramid_length, camera_pyramid_base)
-        orig_pyramid.paint_uniform_color([1.0, 0.2, 0.2])  # 红色
-        orig_pyramid = apply_transform(orig_pyramid, R_np, original_camera_pos.flatten())
-        o3d.io.write_triangle_mesh(os.path.join(output_dir, "camera_original.obj"), orig_pyramid)
-
-        rotated_pyramid = create_camera_pyramid(camera_pyramid_length, camera_pyramid_base)
-        rotated_pyramid.paint_uniform_color([0.2, 0.4, 1.0])  # 蓝色
-        rotated_pyramid = apply_transform(rotated_pyramid, final_R, new_camera_pos.flatten())
-        o3d.io.write_triangle_mesh(os.path.join(output_dir, "camera_rotated.obj"), rotated_pyramid)
-        # End of 相机可视化
-
-        K_np = K.cpu().numpy() if torch.is_tensor(K) else np.array(K)
-        camera = o3d.camera.PinholeCameraIntrinsic(
-            width=render_size,
-            height=render_size,
-            fx=K_np[0, 0],
-            fy=K_np[1, 1],
-            cx=K_np[0, 2],
-            cy=K_np[1, 2]
-        )
-        # original_distance = np.linalg.norm(original_camera_pos - object_center)
-        # new_distance = np.linalg.norm(new_camera_pos - object_center)
-        # print(f"原始相机到物体距离: {original_distance:.3f}")
-        # print(f"新相机到物体距离: {new_distance:.3f}")
-        # print(f"距离差异: {abs(original_distance - new_distance):.6f}")
-        # camera_forward = -final_R[2, :] 
-        # to_object = (object_center.flatten() - new_camera_pos.flatten())
-        # to_object = to_object / np.linalg.norm(to_object)
-        
-        # print(f"相机前向量: {camera_forward}")
-        # print(f"相机到物体方向: {to_object}")
-        # print(f"方向一致性 (dot product): {np.dot(camera_forward, to_object):.3f}")
-        os.makedirs(output_dir, exist_ok=True)
-        human_faces = np.array(self.get_body_faces(sampled=False), dtype=np.int32)
+            img = renderer.render_mesh_hoi(human_verts, object_vertices, img_raw, [0.8, 0.8, 0.8],object_color)
 
 
-        for i in tqdm(range(0, self.seq_length, 2), desc=f"Processing frames with {rotation_angle}° rotation"):
-
-            human_verts = self.get_body_points(i, sampled=False).detach().cpu().numpy()
-            object_vertices = self.get_object_points(i, sampled=True).detach().cpu().numpy()
-            incam_params = (self.global_orient[i], self.transl[i])
-            global_params = (self.global_body_params["global_orient"][i], self.global_body_params["transl"][i])
-            human_verts, object_vertices = transform_to_global(human_verts, object_vertices, incam_params, global_params)
-
-            # transform to global
-
-
-            render.scene.clear_geometry()
-            human_mesh = o3d.geometry.TriangleMesh()
-            human_mesh.vertices = o3d.utility.Vector3dVector(human_verts)
-            human_mesh.triangles = o3d.utility.Vector3iVector(human_faces)
-            human_mesh.compute_vertex_normals()
-
-            transformed_object_mesh = o3d.geometry.TriangleMesh()
-            transformed_object_mesh.vertices = o3d.utility.Vector3dVector(object_vertices)
-            transformed_object_mesh.triangles = o3d.utility.Vector3iVector(self.get_object_faces(i, sampled=True))
-            transformed_object_mesh.compute_vertex_normals()
-            render.scene.add_geometry("human", human_mesh, human_mat)
-            render.scene.add_geometry("object", transformed_object_mesh, object_mat)
-
-            render.setup_camera(camera, view_matrix)
-            rendered_img = render.render_to_image()
             start_frame = (self.start_frame // 2) * 2
-            frame_path = os.path.join(output_dir, f"frame_{i+start_frame:04d}.png")
-            o3d.io.write_image(frame_path, rendered_img)
+            frame_path = os.path.join(output_dir, f"frame_{i + start_frame:04d}.png")
+
+            img = Image.fromarray(img)
+            img.save(frame_path)
+
 
     def create_visualization_video_front(self, output_dir, K, R, T, video_path=None, fps=3):  
         # time0 = time.time()
@@ -1414,4 +1490,49 @@ class VideoBodyObjectOptimizer:
             start_frame = (self.start_frame // 2)*2
             frame_path = os.path.join(output_dir, f"frame_{i+start_frame:04d}.png")
             o3d.io.write_image(frame_path, rendered_img)
- 
+
+    def get_object_params(self, frame_idx=None):
+        if frame_idx is None:
+            frame_idx = self.current_frame
+        if self.is_static_object:
+            frame_idx = 0
+
+        R_residual = self.get_object_transform(frame_idx)
+        R_base = self.base_obj_R[frame_idx]
+        
+        initial_R_tensor = torch.tensor(self.initial_R[frame_idx], dtype=torch.float32, device=R_residual.device)
+        R_final_no_initial = torch.mm(R_residual, R_base)
+        R_final = torch.mm(R_final_no_initial, initial_R_tensor)
+
+        t_residual = self.obj_transl_params[frame_idx]
+        t_base = self.base_obj_transl[frame_idx]
+        
+        centers = torch.tensor(self.centers[frame_idx], dtype=torch.float32, device=R_final.device)
+        t_final = torch.mv(R_final_no_initial, centers) + torch.mv(R_residual, t_base) + t_residual
+        return R_final, t_final
+    def get_body_params(self, frame_idx=None):
+        """
+        获取指定帧的SMPL人体参数
+        :param frame_idx: 帧索引，默认为当前帧
+        :return: 人体参数
+        """
+        if frame_idx is None:
+            frame_idx = self.current_frame
+        self.body_params_sequence["body_pose"][frame_idx + self.start_frame] = self.body_pose_params[frame_idx].reshape(1, -1).detach().cpu()
+        self.body_params_sequence["betas"][frame_idx + self.start_frame] = self.shape_params[frame_idx].reshape(1, -1).detach().cpu()
+        self.body_params_sequence["global_orient"][frame_idx + self.start_frame] = self.global_orient[frame_idx].reshape(1, 3).detach().cpu()
+        self.body_params_sequence["transl"][frame_idx + self.start_frame] = self.transl[frame_idx].reshape(1, -1).detach().cpu()
+        self.hand_poses[str(frame_idx + self.start_frame)]["left_hand"] = self.left_hand_params[frame_idx].reshape(1, -1).detach().cpu().numpy()
+        self.hand_poses[str(frame_idx + self.start_frame)]["right_hand"] = self.right_hand_params[frame_idx].reshape(1, -1).detach().cpu().numpy()
+        return self.body_params_sequence, self.hand_poses
+    def get_optimize_result(self):
+        R_finals = []
+        t_finals = []
+        for i in range(self.seq_length):
+            self.get_body_params(i)  
+            R_final, t_final = self.get_object_params(i)
+            R_finals.append(R_final.detach().cpu().numpy())
+            t_finals.append(t_final.detach().cpu().numpy())
+            # The following two lines seem to modify the instance's state inside a getter, which might be unintended.
+            # However, I will keep them as they are to only address the user's specific concern about R_final and t_final.
+        return self.body_params_sequence, self.hand_poses, R_finals, t_finals
