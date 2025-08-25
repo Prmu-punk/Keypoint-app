@@ -1,0 +1,3 @@
+# python kp_use.py --video_dir /data/boran/4dhoi/Dataset/barebell2 --joints_to_optimize "right_wrist,right_thumb1,right_thumb2,right_thumb3,right_index1,right_index2,right_index3,right_middle1,right_middle2,right_middle3,right_ring1,right_ring2,right_ring3,right_pinky1,right_pinky2,right_pinky3"
+# python kp_use.py --video_dir /data/boran/4dhoi/Dataset/motorbike --joints_to_optimize "pelvis"
+python kp_use.py --video_dir /home/abse/my_shit/4dhoi/kp_app/app_main/barebell --joints_to_optimize "right_wrist,right_thumb1,right_thumb2,right_thumb3,right_index1,right_index2,right_index3,right_middle1,right_middle2,right_middle3,right_ring1,right_ring2,right_ring3,right_pinky1,right_pinky2,right_pinky3" --start_frame 0 --end_frame 20

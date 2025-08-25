@@ -1,0 +1,6 @@
+video_optimizer/smpl_models/
+build/
+app_main.code-workspace
+app_main.spec
+dist/
+data/
